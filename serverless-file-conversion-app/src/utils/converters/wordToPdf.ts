@@ -1,181 +1,137 @@
 import mammoth from 'mammoth';
-import { PDFDocument, rgb, StandardFonts } from 'pdf-lib';
-import { sanitizeForPdf } from '@/utils/sanitizeText';
+import { renderHtmlToPdfBlob } from './htmlToPdfRenderer';
 
 /**
  * Convert Word (DOCX) to PDF format
- * 
- * Strategy: Use mammoth.js to extract text/HTML from DOCX,
- * then render it into a PDF using pdf-lib.
- * 
- * All text is sanitized through sanitizeForPdf() to strip
- * emojis and non-WinAnsi characters that StandardFonts can't encode.
+ *
+ * Strategy:
+ *   1. mammoth.convertToHtml() → rich HTML with headings, lists,
+ *      tables, bold, italic, images, links, etc.
+ *   2. Wrap the HTML in a styled template with proper CSS.
+ *   3. Render via html2canvas → jsPDF (multi-page, pixel-perfect).
  */
 export async function convertWordToPdf(
   file: File,
-  onProgress: (progress: number) => void
+  onProgress: (progress: number) => void,
 ): Promise<Blob> {
-  onProgress(10);
+  onProgress(5);
 
   const arrayBuffer = await file.arrayBuffer();
-  onProgress(20);
+  onProgress(10);
 
-  // Extract text from DOCX using mammoth
-  const result = await mammoth.extractRawText({ arrayBuffer });
-  const text = result.value;
-  onProgress(40);
+  // ---- 1. Convert DOCX → HTML with full formatting ----
+  const result = await mammoth.convertToHtml(
+    { arrayBuffer },
+    {
+      // Make sure images are embedded inline as base64
+      convertImage: mammoth.images.imgElement(function (image) {
+        return image.read('base64').then(function (imageBuffer) {
+          return { src: `data:${image.contentType};base64,${imageBuffer}` };
+        });
+      }),
+    },
+  );
 
-  if (!text || text.trim().length === 0) {
+  const rawHtml = result.value;
+  onProgress(30);
+
+  if (!rawHtml || rawHtml.trim().length === 0 || rawHtml.trim() === '<p></p>') {
     throw new Error(
-      'Could not extract any text content from this Word document. ' +
-      'The file may be image-based, corrupted, or in an unsupported format.'
+      'Could not extract any content from this Word document. ' +
+      'The file may be image-only, password-protected, or corrupted.',
     );
   }
 
-  // Create PDF document
-  const pdfDoc = await PDFDocument.create();
-  const font = await pdfDoc.embedFont(StandardFonts.Helvetica);
-  const boldFont = await pdfDoc.embedFont(StandardFonts.HelveticaBold);
-
-  const fontSize = 11;
-  const titleFontSize = 16;
-  const lineHeight = fontSize * 1.5;
-  const margin = 56;
-  const pageWidth = 595.28; // A4 width in points
-  const pageHeight = 841.89; // A4 height in points
-  const maxLineWidth = pageWidth - margin * 2;
-
-  onProgress(50);
-
-  // Sanitize the title (filename without extension)
-  const titleText = sanitizeForPdf(file.name.replace(/\.[^.]+$/, ''));
-
-  // Split text into paragraphs and build wrapped lines
-  const paragraphs = text.split('\n');
-  const allLines: { text: string; isTitle: boolean; isBullet: boolean }[] = [];
-
-  // Add title
-  allLines.push({ text: titleText, isTitle: true, isBullet: false });
-  allLines.push({ text: '', isTitle: false, isBullet: false }); // blank line after title
-
-  for (const paragraph of paragraphs) {
-    const trimmed = paragraph.trim();
-
-    if (trimmed === '') {
-      allLines.push({ text: '', isTitle: false, isBullet: false });
-      continue;
-    }
-
-    // Sanitize the paragraph text to remove unsupported Unicode chars
-    const safe = sanitizeForPdf(trimmed);
-    if (!safe) continue; // paragraph was entirely emojis / unsupported chars
-
-    // Detect bullet-like lines
-    const isBullet = /^[-*>+#\[]/.test(safe) || /^\d+[.)]\s/.test(safe);
-
-    // Word-wrap the sanitized text
-    const words = safe.split(/\s+/);
-    let currentLine = '';
-
-    for (const word of words) {
-      if (!word) continue;
-      const testLine = currentLine ? `${currentLine} ${word}` : word;
-      const testWidth = font.widthOfTextAtSize(testLine, fontSize);
-
-      if (testWidth > maxLineWidth && currentLine) {
-        allLines.push({ text: currentLine, isTitle: false, isBullet });
-        currentLine = word;
-      } else {
-        currentLine = testLine;
-      }
-    }
-    if (currentLine) {
-      allLines.push({ text: currentLine, isTitle: false, isBullet });
-    }
+  // Log any mammoth warnings for debugging
+  if (result.messages.length > 0) {
+    console.warn('Mammoth warnings:', result.messages);
   }
 
-  onProgress(60);
+  // ---- 2. Wrap in a beautiful styled template ----
+  const styledHtml = `
+    <style>
+      * { margin: 0; padding: 0; box-sizing: border-box; }
 
-  // Render lines onto PDF pages
-  let currentY = pageHeight - margin;
-  let page = pdfDoc.addPage([pageWidth, pageHeight]);
-  const totalLines = allLines.length;
+      body, html {
+        font-family: 'Segoe UI', 'Helvetica Neue', Arial, sans-serif;
+        font-size: 14px;
+        line-height: 1.7;
+        color: #1a1a2e;
+      }
 
-  // Draw a thin accent line at top of first page
-  page.drawLine({
-    start: { x: margin, y: pageHeight - margin + 10 },
-    end: { x: pageWidth - margin, y: pageHeight - margin + 10 },
-    thickness: 2,
-    color: rgb(0.55, 0.36, 0.96),
+      h1 { font-size: 26px; font-weight: 700; color: #0f0f23; margin: 24px 0 12px 0; padding-bottom: 6px; border-bottom: 2px solid #e0e0e0; }
+      h2 { font-size: 21px; font-weight: 700; color: #1a1a3e; margin: 20px 0 10px 0; }
+      h3 { font-size: 18px; font-weight: 600; color: #2a2a4e; margin: 16px 0 8px 0; }
+      h4 { font-size: 16px; font-weight: 600; color: #333; margin: 14px 0 6px 0; }
+      h5, h6 { font-size: 14px; font-weight: 600; color: #444; margin: 12px 0 4px 0; }
+
+      p { margin: 0 0 10px 0; text-align: justify; }
+
+      strong, b { font-weight: 700; }
+      em, i { font-style: italic; }
+      u { text-decoration: underline; }
+      s, strike { text-decoration: line-through; }
+
+      ul, ol { margin: 8px 0 12px 28px; padding: 0; }
+      li { margin-bottom: 4px; }
+
+      table {
+        width: 100%;
+        border-collapse: collapse;
+        margin: 14px 0;
+        font-size: 13px;
+      }
+      th, td {
+        border: 1px solid #ccc;
+        padding: 8px 10px;
+        text-align: left;
+        vertical-align: top;
+      }
+      th { background: #f0f0f5; font-weight: 600; }
+      tr:nth-child(even) td { background: #fafafe; }
+
+      a { color: #2563eb; text-decoration: underline; }
+
+      img { max-width: 100%; height: auto; margin: 8px 0; }
+
+      blockquote {
+        border-left: 4px solid #8b5cf6;
+        padding: 8px 16px;
+        margin: 12px 0;
+        background: #f8f7ff;
+        color: #333;
+        font-style: italic;
+      }
+
+      code, pre {
+        font-family: 'Consolas', 'Courier New', monospace;
+        background: #f4f4f8;
+        border-radius: 3px;
+        font-size: 13px;
+      }
+      code { padding: 1px 4px; }
+      pre { padding: 12px; margin: 10px 0; overflow-x: auto; border: 1px solid #e0e0e0; }
+
+      sup { font-size: 0.75em; vertical-align: super; }
+      sub { font-size: 0.75em; vertical-align: sub; }
+    </style>
+
+    <div style="max-width: 714px;">
+      ${rawHtml}
+    </div>
+  `;
+
+  onProgress(35);
+
+  // ---- 3. Render HTML → PDF ----
+  const blob = await renderHtmlToPdfBlob(styledHtml, {
+    containerWidth: 794,
+    scale: 2,
+    onProgress: (pct) => {
+      // Map renderer's 0-100 to our 35-100 range
+      onProgress(35 + pct * 0.65);
+    },
   });
 
-  for (let i = 0; i < allLines.length; i++) {
-    const line = allLines[i];
-    const chosenFont = line.isTitle ? boldFont : font;
-    const chosenSize = line.isTitle ? titleFontSize : fontSize;
-    const chosenLineHeight = line.isTitle ? titleFontSize * 1.8 : lineHeight;
-
-    // Need a new page?
-    if (currentY - chosenLineHeight < margin) {
-      page = pdfDoc.addPage([pageWidth, pageHeight]);
-      currentY = pageHeight - margin;
-    }
-
-    if (line.text) {
-      const xOffset = line.isBullet && !line.isTitle ? margin + 12 : margin;
-
-      page.drawText(line.text, {
-        x: xOffset,
-        y: currentY,
-        size: chosenSize,
-        font: chosenFont,
-        color: line.isTitle
-          ? rgb(0.12, 0.12, 0.18)
-          : rgb(0.18, 0.18, 0.22),
-      });
-
-      // Underline the title
-      if (line.isTitle) {
-        const titleWidth = boldFont.widthOfTextAtSize(line.text, titleFontSize);
-        page.drawLine({
-          start: { x: margin, y: currentY - 4 },
-          end: { x: margin + titleWidth, y: currentY - 4 },
-          thickness: 0.8,
-          color: rgb(0.55, 0.36, 0.96),
-        });
-      }
-    }
-
-    currentY -= chosenLineHeight;
-
-    // Update progress (60-95 range)
-    if (i % 20 === 0 || i === totalLines - 1) {
-      onProgress(60 + (i / totalLines) * 35);
-    }
-  }
-
-  // Add page numbers
-  const totalPages = pdfDoc.getPageCount();
-  const allPages = pdfDoc.getPages();
-  for (let p = 0; p < totalPages; p++) {
-    const pg = allPages[p];
-    const label = `Page ${p + 1} of ${totalPages}`;
-    const labelWidth = font.widthOfTextAtSize(label, 8);
-    pg.drawText(label, {
-      x: pageWidth - margin - labelWidth,
-      y: 28,
-      size: 8,
-      font,
-      color: rgb(0.55, 0.55, 0.6),
-    });
-  }
-
-  onProgress(97);
-
-  // Serialize to bytes
-  const pdfBytes = await pdfDoc.save();
-  const blob = new Blob([pdfBytes.buffer as ArrayBuffer], { type: 'application/pdf' });
-
-  onProgress(100);
   return blob;
 }

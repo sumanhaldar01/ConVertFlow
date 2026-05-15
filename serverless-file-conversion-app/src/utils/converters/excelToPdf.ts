@@ -1,207 +1,233 @@
 import ExcelJS from 'exceljs';
-import { PDFDocument, rgb, StandardFonts } from 'pdf-lib';
-import { sanitizeForPdf } from '@/utils/sanitizeText';
+import { renderHtmlToPdfBlob } from './htmlToPdfRenderer';
 
 /**
  * Convert Excel (XLSX) to PDF format
- * 
- * Strategy: Parse XLSX with ExcelJS, then render each worksheet
- * as a table in PDF using pdf-lib. All text is sanitized for
- * WinAnsi encoding compatibility.
+ *
+ * Strategy:
+ *   1. Parse the workbook with ExcelJS.
+ *   2. Build a rich HTML table for each worksheet, preserving:
+ *      - Cell values (text, numbers, dates, formulas, hyperlinks)
+ *      - Basic cell styling (bold, italic, font color, background color, alignment)
+ *      - Column widths
+ *      - Merged cells
+ *   3. Render the HTML to PDF via html2canvas → jsPDF (landscape A4).
  */
 export async function convertExcelToPdf(
   file: File,
-  onProgress: (progress: number) => void
+  onProgress: (progress: number) => void,
 ): Promise<Blob> {
-  onProgress(10);
+  onProgress(5);
 
   const arrayBuffer = await file.arrayBuffer();
-  onProgress(20);
+  onProgress(10);
 
-  // Load the workbook
   const workbook = new ExcelJS.Workbook();
   await workbook.xlsx.load(arrayBuffer);
-  onProgress(35);
+  onProgress(25);
 
-  // Create PDF document
-  const pdfDoc = await PDFDocument.create();
-  const font = await pdfDoc.embedFont(StandardFonts.Helvetica);
-  const boldFont = await pdfDoc.embedFont(StandardFonts.HelveticaBold);
-
-  const fontSize = 9;
-  const headerFontSize = 11;
-  const sheetTitleSize = 14;
-  const cellPadding = 4;
-  const rowHeight = fontSize + cellPadding * 2 + 2;
-  const margin = 40;
-  const pageWidth = 841.89; // A4 landscape width
-  const pageHeight = 595.28; // A4 landscape height
-
-  const worksheets = workbook.worksheets;
-  const totalSheets = worksheets.length;
-
-  if (totalSheets === 0) {
+  const sheets = workbook.worksheets;
+  if (sheets.length === 0) {
     throw new Error('The Excel file contains no worksheets.');
   }
 
-  onProgress(40);
+  // ---- Build HTML for each sheet ----
+  const sheetHtmlParts: string[] = [];
 
-  for (let si = 0; si < totalSheets; si++) {
-    const worksheet = worksheets[si];
+  for (let si = 0; si < sheets.length; si++) {
+    const ws = sheets[si];
 
-    // Collect all row data
-    const rows: string[][] = [];
-    let maxCols = 0;
+    // Gather merged-cell ranges for colspan/rowspan handling
+    const mergedMap = new Map<string, { startRow: number; startCol: number; rows: number; cols: number }>();
+    const skipCells = new Set<string>();
 
-    worksheet.eachRow({ includeEmpty: false }, (row) => {
-      const rowData: string[] = [];
-      row.eachCell({ includeEmpty: true }, (cell, colNumber) => {
-        const value = cell.value;
-        let displayValue = '';
-        if (value === null || value === undefined) {
-          displayValue = '';
-        } else if (typeof value === 'object' && 'result' in value) {
-          displayValue = String(value.result ?? '');
-        } else if (typeof value === 'object' && 'text' in value) {
-          displayValue = String(value.text ?? '');
-        } else if (value instanceof Date) {
-          displayValue = value.toLocaleDateString();
-        } else {
-          displayValue = String(value);
+    // ExcelJS stores merges as "A1:C3" style strings
+    for (const mergeRange of (ws as unknown as { _merges: Record<string, { model: { top: number; left: number; bottom: number; right: number } }> })._merges
+      ? Object.values((ws as unknown as { _merges: Record<string, { model: { top: number; left: number; bottom: number; right: number } }> })._merges)
+      : []) {
+      const m = mergeRange.model;
+      const rows = m.bottom - m.top + 1;
+      const cols = m.right - m.left + 1;
+      mergedMap.set(`${m.top}-${m.left}`, { startRow: m.top, startCol: m.left, rows, cols });
+      for (let r = m.top; r <= m.bottom; r++) {
+        for (let c = m.left; c <= m.right; c++) {
+          if (r !== m.top || c !== m.left) {
+            skipCells.add(`${r}-${c}`);
+          }
         }
-        // Sanitize for WinAnsi
-        displayValue = sanitizeForPdf(displayValue);
-        // Pad array to fill gaps
-        while (rowData.length < colNumber - 1) rowData.push('');
-        rowData.push(displayValue);
-      });
-      maxCols = Math.max(maxCols, rowData.length);
-      rows.push(rowData);
-    });
-
-    if (rows.length === 0) continue;
-
-    // Ensure all rows have same number of columns
-    for (const row of rows) {
-      while (row.length < maxCols) row.push('');
+      }
     }
 
-    // Calculate column widths (distribute evenly with max constraint)
-    const availableWidth = pageWidth - margin * 2;
-    const colWidth = Math.min(availableWidth / maxCols, 150);
-    const tableWidth = colWidth * maxCols;
-
-    // Render rows onto pages
-    let page = pdfDoc.addPage([pageWidth, pageHeight]);
-    let currentY = pageHeight - margin;
-
-    // Sheet title (sanitized)
-    const sheetTitle = sanitizeForPdf(`Sheet: ${worksheet.name}`);
-    page.drawText(sheetTitle, {
-      x: margin,
-      y: currentY,
-      size: sheetTitleSize,
-      font: boldFont,
-      color: rgb(0.2, 0.2, 0.3),
-    });
-    currentY -= sheetTitleSize + 12;
-
-    for (let ri = 0; ri < rows.length; ri++) {
-      const row = rows[ri];
-      const isHeader = ri === 0;
-      const currentFont = isHeader ? boldFont : font;
-      const currentFontSize = isHeader ? headerFontSize : fontSize;
-
-      // Check if we need a new page
-      if (currentY - rowHeight < margin) {
-        page = pdfDoc.addPage([pageWidth, pageHeight]);
-        currentY = pageHeight - margin;
-      }
-
-      // Draw row background for header
-      if (isHeader) {
-        page.drawRectangle({
-          x: margin,
-          y: currentY - rowHeight + cellPadding,
-          width: Math.min(tableWidth, availableWidth),
-          height: rowHeight,
-          color: rgb(0.15, 0.15, 0.25),
-        });
-      } else if (ri % 2 === 0) {
-        page.drawRectangle({
-          x: margin,
-          y: currentY - rowHeight + cellPadding,
-          width: Math.min(tableWidth, availableWidth),
-          height: rowHeight,
-          color: rgb(0.95, 0.95, 0.97),
-        });
-      }
-
-      // Draw cells
-      const maxVisibleCols = Math.floor(availableWidth / colWidth);
-      for (let ci = 0; ci < row.length && ci < maxVisibleCols; ci++) {
-        let cellText = row[ci];
-        // Truncate long text
-        const maxChars = Math.floor(colWidth / (currentFontSize * 0.5));
-        if (cellText.length > maxChars) {
-          cellText = cellText.substring(0, maxChars - 2) + '..';
-        }
-
-        const textColor = isHeader ? rgb(1, 1, 1) : rgb(0.2, 0.2, 0.2);
-
-        if (cellText) {
-          page.drawText(cellText, {
-            x: margin + ci * colWidth + cellPadding,
-            y: currentY - cellPadding,
-            size: currentFontSize,
-            font: currentFont,
-            color: textColor,
-          });
-        }
-
-        // Draw cell border (vertical line)
-        page.drawLine({
-          start: { x: margin + ci * colWidth, y: currentY + cellPadding },
-          end: { x: margin + ci * colWidth, y: currentY - rowHeight + cellPadding },
-          thickness: 0.5,
-          color: rgb(0.8, 0.8, 0.8),
-        });
-      }
-
-      // Draw horizontal line
-      page.drawLine({
-        start: { x: margin, y: currentY - rowHeight + cellPadding },
-        end: { x: margin + Math.min(tableWidth, availableWidth), y: currentY - rowHeight + cellPadding },
-        thickness: 0.5,
-        color: rgb(0.8, 0.8, 0.8),
+    // Determine actual used range
+    let maxCol = 0;
+    let maxRow = 0;
+    ws.eachRow({ includeEmpty: false }, (row, rowNumber) => {
+      maxRow = Math.max(maxRow, rowNumber);
+      row.eachCell({ includeEmpty: false }, (_cell, colNumber) => {
+        maxCol = Math.max(maxCol, colNumber);
       });
-
-      currentY -= rowHeight;
-
-      // Update progress
-      const sheetProgress = (si / totalSheets) * 55;
-      const rowProgress = ((ri / rows.length) * 55) / totalSheets;
-      onProgress(40 + sheetProgress + rowProgress);
-    }
-  }
-
-  // If no data was rendered, add an info page
-  if (pdfDoc.getPageCount() === 0) {
-    const page = pdfDoc.addPage([pageWidth, pageHeight]);
-    page.drawText('No data found in the Excel file.', {
-      x: margin,
-      y: pageHeight / 2,
-      size: 14,
-      font,
-      color: rgb(0.4, 0.4, 0.4),
     });
+
+    if (maxRow === 0) continue; // empty sheet
+
+    // Build table rows
+    const tableRows: string[] = [];
+
+    for (let r = 1; r <= maxRow; r++) {
+      const row = ws.getRow(r);
+      const cells: string[] = [];
+
+      for (let c = 1; c <= maxCol; c++) {
+        const key = `${r}-${c}`;
+        if (skipCells.has(key)) continue;
+
+        const cell = row.getCell(c);
+        const value = getCellDisplayValue(cell);
+
+        // Styling
+        const styles: string[] = [];
+        const font = cell.font;
+        if (font?.bold) styles.push('font-weight:700');
+        if (font?.italic) styles.push('font-style:italic');
+        if (font?.underline) styles.push('text-decoration:underline');
+        if (font?.color?.argb) {
+          const hex = argbToHex(font.color.argb);
+          if (hex !== '#000000') styles.push(`color:${hex}`);
+        }
+        if (font?.size) styles.push(`font-size:${Math.max(11, Math.min(font.size, 18))}px`);
+
+        const fill = cell.fill;
+        if (fill && fill.type === 'pattern' && fill.fgColor?.argb) {
+          const bg = argbToHex(fill.fgColor.argb);
+          if (bg !== '#000000' && bg !== '#ffffff') styles.push(`background:${bg}`);
+        }
+
+        const align = cell.alignment;
+        if (align?.horizontal) styles.push(`text-align:${align.horizontal}`);
+        if (align?.vertical) styles.push(`vertical-align:${align.vertical === 'middle' ? 'middle' : align.vertical === 'top' ? 'top' : 'bottom'}`);
+
+        // Merge attributes
+        const merge = mergedMap.get(key);
+        let attrs = '';
+        if (merge) {
+          if (merge.cols > 1) attrs += ` colspan="${merge.cols}"`;
+          if (merge.rows > 1) attrs += ` rowspan="${merge.rows}"`;
+        }
+
+        const tag = r === 1 ? 'th' : 'td';
+        cells.push(`<${tag}${attrs} style="${styles.join(';')}">${escapeHtml(value)}</${tag}>`);
+      }
+
+      tableRows.push(`<tr>${cells.join('')}</tr>`);
+    }
+
+    sheetHtmlParts.push(`
+      <div style="margin-bottom:32px;">
+        <h2 style="font-size:18px;color:#1a1a3e;margin-bottom:10px;padding-bottom:4px;border-bottom:2px solid #8b5cf6;">
+          📊 ${escapeHtml(ws.name)}
+        </h2>
+        <table>${tableRows.join('\n')}</table>
+      </div>
+    `);
+
+    onProgress(25 + ((si + 1) / sheets.length) * 25);
   }
 
-  onProgress(95);
+  if (sheetHtmlParts.length === 0) {
+    throw new Error('No data found in any worksheet.');
+  }
 
-  const pdfBytes = await pdfDoc.save();
-  const blob = new Blob([pdfBytes.buffer as ArrayBuffer], { type: 'application/pdf' });
+  onProgress(50);
 
-  onProgress(100);
+  // ---- Wrap in styled template ----
+  const fullHtml = `
+    <style>
+      * { margin: 0; padding: 0; box-sizing: border-box; }
+      body {
+        font-family: 'Segoe UI', Arial, sans-serif;
+        font-size: 13px;
+        color: #1a1a2e;
+        line-height: 1.5;
+      }
+
+      table {
+        width: 100%;
+        border-collapse: collapse;
+        font-size: 12px;
+        table-layout: auto;
+      }
+      th, td {
+        border: 1px solid #c0c0c8;
+        padding: 6px 10px;
+        text-align: left;
+        vertical-align: middle;
+        word-break: break-word;
+        max-width: 250px;
+      }
+      th {
+        background: #2d2b55;
+        color: #fff;
+        font-weight: 600;
+        font-size: 12px;
+      }
+      tr:nth-child(even) td { background: #f5f5fa; }
+      tr:hover td { background: #eeeef6; }
+
+      h2 { font-size: 18px; }
+    </style>
+    ${sheetHtmlParts.join('\n')}
+  `;
+
+  // Render landscape since spreadsheets are wide
+  const blob = await renderHtmlToPdfBlob(fullHtml, {
+    containerWidth: 1100,
+    scale: 2,
+    landscape: true,
+    onProgress: (pct) => onProgress(50 + pct * 0.5),
+  });
+
   return blob;
+}
+
+/* ---- Helpers ---- */
+
+function getCellDisplayValue(cell: ExcelJS.Cell): string {
+  const v = cell.value;
+  if (v === null || v === undefined) return '';
+
+  // Formula result
+  if (typeof v === 'object' && 'result' in v) {
+    const res = (v as { result: unknown }).result;
+    if (res instanceof Date) return res.toLocaleDateString();
+    return String(res ?? '');
+  }
+  // Rich text
+  if (typeof v === 'object' && 'richText' in v) {
+    return (v as { richText: { text: string }[] }).richText.map((r) => r.text).join('');
+  }
+  // Hyperlink
+  if (typeof v === 'object' && 'text' in v) {
+    return String((v as { text: string }).text);
+  }
+  // Date
+  if (v instanceof Date) return v.toLocaleDateString();
+  // Boolean
+  if (typeof v === 'boolean') return v ? 'TRUE' : 'FALSE';
+
+  return String(v);
+}
+
+function argbToHex(argb: string): string {
+  // ExcelJS stores colors as ARGB (e.g. "FF2A2A4E")
+  if (!argb || argb.length < 6) return '#000000';
+  const hex = argb.length === 8 ? argb.substring(2) : argb;
+  return `#${hex}`;
+}
+
+function escapeHtml(str: string): string {
+  return str
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
 }

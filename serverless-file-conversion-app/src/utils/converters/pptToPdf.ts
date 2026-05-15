@@ -1,237 +1,349 @@
 import JSZip from 'jszip';
-import { PDFDocument, rgb, StandardFonts } from 'pdf-lib';
-import { sanitizeForPdf } from '@/utils/sanitizeText';
+import { renderHtmlToPdfBlob } from './htmlToPdfRenderer';
 
 /**
  * Convert PowerPoint (PPTX) to PDF format
- * 
- * Strategy: PPTX files are ZIP archives containing XML.
- * We parse the XML to extract slide text content,
- * then render each slide as a page in PDF.
- * All text is sanitized for WinAnsi encoding compatibility.
+ *
+ * Strategy:
+ *   1. PPTX is a ZIP of XML files. We parse the XML to extract:
+ *      - Text content from each slide (paragraphs in <a:p>, runs in <a:r>)
+ *      - Basic formatting: bold, italic, font size, color, alignment
+ *      - Bullet/numbered lists
+ *      - Images (embedded in the PPTX)
+ *      - Slide layout/master text as fallback
+ *   2. Render each slide as a styled HTML "card" with proper CSS.
+ *   3. Convert to PDF via html2canvas → jsPDF.
  */
 export async function convertPptToPdf(
   file: File,
-  onProgress: (progress: number) => void
+  onProgress: (progress: number) => void,
 ): Promise<Blob> {
-  onProgress(10);
+  onProgress(5);
 
   const arrayBuffer = await file.arrayBuffer();
-  onProgress(20);
+  onProgress(10);
 
-  // PPTX is a ZIP file - extract it
   let zip: JSZip;
   try {
     zip = await JSZip.loadAsync(arrayBuffer);
   } catch {
     throw new Error(
-      'Could not parse the PowerPoint file. It may be corrupted or in the older .ppt format. ' +
-      'Please save it as .pptx and try again.'
+      'Could not parse the PowerPoint file. It may be corrupted or in ' +
+      'the legacy .ppt format. Please save as .pptx and try again.',
     );
   }
-  onProgress(30);
+  onProgress(20);
 
-  // Find all slide XML files
+  // ---- Find all slide XML files ----
   const slideFiles: string[] = [];
-  zip.forEach((relativePath) => {
-    if (relativePath.match(/^ppt\/slides\/slide\d+\.xml$/)) {
-      slideFiles.push(relativePath);
+  zip.forEach((path) => {
+    if (/^ppt\/slides\/slide\d+\.xml$/.test(path)) {
+      slideFiles.push(path);
     }
   });
-
-  // Sort slides by number
   slideFiles.sort((a, b) => {
-    const numA = parseInt(a.match(/slide(\d+)/)?.[1] || '0');
-    const numB = parseInt(b.match(/slide(\d+)/)?.[1] || '0');
-    return numA - numB;
+    const na = parseInt(a.match(/slide(\d+)/)?.[1] || '0');
+    const nb = parseInt(b.match(/slide(\d+)/)?.[1] || '0');
+    return na - nb;
   });
 
   if (slideFiles.length === 0) {
     throw new Error(
-      'No slides found in the PowerPoint file. ' +
-      'The file may be empty, corrupted, or in the legacy .ppt format.'
+      'No slides found. The file may be empty or in legacy .ppt format.',
     );
   }
 
-  onProgress(40);
+  // ---- Extract images into a map (rId → dataURL) ----
+  const imageMap = new Map<string, string>();
+  const mediaFiles = Object.keys(zip.files).filter((p) => p.startsWith('ppt/media/'));
+  for (const mf of mediaFiles) {
+    try {
+      const data = await zip.file(mf)!.async('base64');
+      const ext = mf.split('.').pop()?.toLowerCase() || 'png';
+      const mime = ext === 'jpg' || ext === 'jpeg' ? 'image/jpeg' :
+                   ext === 'gif' ? 'image/gif' :
+                   ext === 'svg' ? 'image/svg+xml' : 'image/png';
+      imageMap.set(mf.split('/').pop()!, `data:${mime};base64,${data}`);
+    } catch { /* skip unreadable media */ }
+  }
 
-  // Extract text from each slide
-  const slideContents: { texts: string[] }[] = [];
+  onProgress(30);
 
-  for (let i = 0; i < slideFiles.length; i++) {
-    const slideXml = await zip.file(slideFiles[i])?.async('text');
+  // ---- Parse each slide ----
+  const slideHtmlParts: string[] = [];
+
+  for (let si = 0; si < slideFiles.length; si++) {
+    const slideXml = await zip.file(slideFiles[si])?.async('text');
     if (!slideXml) continue;
 
-    const texts = extractTextsFromXml(slideXml);
-    slideContents.push({ texts });
-    onProgress(40 + (i / slideFiles.length) * 30);
+    // Load corresponding relationship file for image references
+    const relsPath = slideFiles[si].replace('slides/', 'slides/_rels/') + '.rels';
+    const relsXml = await zip.file(relsPath)?.async('text').catch(() => '');
+    const rIdToMedia = parseRels(relsXml || '');
+
+    // Parse the slide XML into structured content
+    const content = parseSlideXml(slideXml, rIdToMedia, imageMap);
+    const slideNum = si + 1;
+
+    slideHtmlParts.push(`
+      <div class="slide">
+        <div class="slide-number">${slideNum} / ${slideFiles.length}</div>
+        <div class="slide-content">
+          ${content || `<p class="empty-slide">Slide ${slideNum}</p>`}
+        </div>
+      </div>
+    `);
+
+    onProgress(30 + ((si + 1) / slideFiles.length) * 25);
   }
 
-  onProgress(70);
+  onProgress(55);
 
-  // Create PDF document with slide-like pages (16:9 aspect ratio)
-  const pdfDoc = await PDFDocument.create();
-  const font = await pdfDoc.embedFont(StandardFonts.Helvetica);
-  const boldFont = await pdfDoc.embedFont(StandardFonts.HelveticaBold);
+  // ---- Build full HTML ----
+  const fullHtml = `
+    <style>
+      * { margin: 0; padding: 0; box-sizing: border-box; }
 
-  const slideWidth = 960;
-  const slideHeight = 540;
-  const margin = 50;
-  const titleFontSize = 24;
-  const bodyFontSize = 14;
-  const lineHeight = bodyFontSize * 1.6;
-
-  for (let i = 0; i < slideContents.length; i++) {
-    const slide = slideContents[i];
-    const page = pdfDoc.addPage([slideWidth, slideHeight]);
-
-    // Draw slide background
-    page.drawRectangle({
-      x: 0,
-      y: 0,
-      width: slideWidth,
-      height: slideHeight,
-      color: rgb(1, 1, 1),
-    });
-
-    // Draw subtle border
-    page.drawRectangle({
-      x: 2,
-      y: 2,
-      width: slideWidth - 4,
-      height: slideHeight - 4,
-      borderColor: rgb(0.85, 0.85, 0.9),
-      borderWidth: 1,
-      color: rgb(0.99, 0.99, 1),
-    });
-
-    // Draw slide number
-    const slideNum = `${i + 1} / ${slideContents.length}`;
-    page.drawText(slideNum, {
-      x: slideWidth - margin - 40,
-      y: 20,
-      size: 10,
-      font: font,
-      color: rgb(0.6, 0.6, 0.65),
-    });
-
-    // Draw title (first text element)
-    let currentY = slideHeight - margin - titleFontSize;
-
-    if (slide.texts.length > 0) {
-      // Sanitize title for WinAnsi
-      const titleText = sanitizeForPdf(slide.texts[0]);
-      const truncTitle = truncateText(titleText, boldFont, titleFontSize, slideWidth - margin * 2);
-
-      if (truncTitle) {
-        page.drawText(truncTitle, {
-          x: margin,
-          y: currentY,
-          size: titleFontSize,
-          font: boldFont,
-          color: rgb(0.1, 0.1, 0.2),
-        });
-      }
-      currentY -= titleFontSize + 20;
-
-      // Draw separator line
-      page.drawLine({
-        start: { x: margin, y: currentY + 8 },
-        end: { x: slideWidth - margin, y: currentY + 8 },
-        thickness: 1.5,
-        color: rgb(0.55, 0.36, 0.96), // Purple accent
-      });
-      currentY -= 15;
-    }
-
-    // Draw body text
-    for (let ti = 1; ti < slide.texts.length; ti++) {
-      if (currentY < margin + 30) break;
-
-      // Sanitize body text for WinAnsi
-      const rawText = slide.texts[ti];
-      const text = sanitizeForPdf(rawText);
-      if (!text || !text.trim()) continue;
-
-      // Word wrap
-      const words = text.split(' ');
-      let line = '';
-      const maxWidth = slideWidth - margin * 2;
-
-      for (const word of words) {
-        if (!word) continue;
-        const testLine = line ? `${line} ${word}` : word;
-        const testWidth = font.widthOfTextAtSize(testLine, bodyFontSize);
-
-        if (testWidth > maxWidth && line) {
-          if (currentY < margin + 30) break;
-          page.drawText(line, {
-            x: margin + 10,
-            y: currentY,
-            size: bodyFontSize,
-            font: font,
-            color: rgb(0.25, 0.25, 0.3),
-          });
-          currentY -= lineHeight;
-          line = word;
-        } else {
-          line = testLine;
-        }
+      .slide {
+        width: 960px;
+        min-height: 540px;
+        background: #ffffff;
+        border: 1px solid #e0e0e8;
+        border-radius: 8px;
+        padding: 48px 56px;
+        margin-bottom: 24px;
+        position: relative;
+        page-break-after: always;
+        box-shadow: 0 2px 12px rgba(0,0,0,0.06);
       }
 
-      if (line && currentY >= margin + 30) {
-        page.drawText(line, {
-          x: margin + 10,
-          y: currentY,
-          size: bodyFontSize,
-          font: font,
-          color: rgb(0.25, 0.25, 0.3),
-        });
-        currentY -= lineHeight + 4;
+      .slide-number {
+        position: absolute;
+        bottom: 16px;
+        right: 24px;
+        font-size: 12px;
+        color: #999;
       }
-    }
 
-    onProgress(70 + (i / slideContents.length) * 25);
-  }
+      .slide-content h1, .slide-content .title {
+        font-size: 30px;
+        font-weight: 700;
+        color: #1a1a3e;
+        margin-bottom: 12px;
+        line-height: 1.3;
+      }
+      .slide-content h2, .slide-content .subtitle {
+        font-size: 22px;
+        font-weight: 600;
+        color: #2a2a5e;
+        margin-bottom: 10px;
+        line-height: 1.35;
+      }
 
-  onProgress(95);
+      .slide-content p {
+        font-size: 16px;
+        color: #2c2c2c;
+        margin-bottom: 8px;
+        line-height: 1.65;
+        font-family: 'Segoe UI', Arial, sans-serif;
+      }
 
-  const pdfBytes = await pdfDoc.save();
-  const blob = new Blob([pdfBytes.buffer as ArrayBuffer], { type: 'application/pdf' });
+      .slide-content ul, .slide-content ol {
+        margin: 8px 0 12px 32px;
+        font-size: 16px;
+        color: #2c2c2c;
+      }
+      .slide-content li {
+        margin-bottom: 6px;
+        line-height: 1.55;
+      }
 
-  onProgress(100);
+      .slide-content img {
+        max-width: 80%;
+        max-height: 320px;
+        margin: 12px auto;
+        display: block;
+      }
+
+      .empty-slide {
+        color: #aaa;
+        font-size: 18px;
+        text-align: center;
+        padding-top: 200px;
+      }
+
+      .slide-divider {
+        width: 100%;
+        height: 3px;
+        background: linear-gradient(90deg, #8b5cf6, #06b6d4);
+        margin: 12px 0 16px 0;
+        border-radius: 2px;
+      }
+
+      .bold { font-weight: 700; }
+      .italic { font-style: italic; }
+      .underline { text-decoration: underline; }
+    </style>
+    ${slideHtmlParts.join('\n')}
+  `;
+
+  // ---- Render to PDF (landscape) ----
+  const blob = await renderHtmlToPdfBlob(fullHtml, {
+    containerWidth: 1060,
+    scale: 2,
+    landscape: true,
+    onProgress: (pct) => onProgress(55 + pct * 0.45),
+  });
+
   return blob;
 }
 
+/* ===== XML Parsing Helpers ===== */
+
 /**
- * Extract text content from PPTX slide XML.
- * Parses <a:p> paragraphs and <a:t> text runs.
+ * Parse a .rels XML to build rId → media filename mapping
  */
-function extractTextsFromXml(xml: string): string[] {
-  const texts: string[] = [];
+function parseRels(xml: string): Map<string, string> {
+  const map = new Map<string, string>();
+  const regex = /Relationship\s+Id="(rId\d+)"[^>]*Target="([^"]*)"/g;
+  let match;
+  while ((match = regex.exec(xml)) !== null) {
+    const target = match[2];
+    if (target.includes('media/')) {
+      map.set(match[1], target.split('/').pop()!);
+    }
+  }
+  return map;
+}
 
-  // Split by <a:p> paragraph elements
-  const paragraphs = xml.split(/<a:p[\s>]/);
+/**
+ * Parse slide XML into HTML string.
+ * Extracts text runs with formatting, paragraphs, bullets, and images.
+ */
+function parseSlideXml(
+  xml: string,
+  rIdToMedia: Map<string, string>,
+  imageMap: Map<string, string>,
+): string {
+  const parts: string[] = [];
 
-  for (const para of paragraphs) {
-    const textMatches = para.match(/<a:t>([\s\S]*?)<\/a:t>/g);
-    if (textMatches) {
-      const paraText = textMatches
-        .map((match) => match.replace(/<\/?a:t>/g, ''))
-        .join('')
-        .trim();
-      if (paraText) {
-        texts.push(decodeXmlEntities(paraText));
+  // Find all shape trees - text can be in <p:sp>, <p:graphicFrame>, etc.
+  // We look for all <p:txBody> (text body) elements which contain paragraphs
+
+  const textBodies = xml.split(/<p:txBody>|<p:txBody\s[^>]*>/);
+
+  let isFirstTextBody = true;
+
+  for (let tbi = 1; tbi < textBodies.length; tbi++) {
+    const tbContent = textBodies[tbi].split('</p:txBody>')[0];
+    if (!tbContent) continue;
+
+    const paragraphs = extractParagraphs(tbContent);
+    if (paragraphs.length === 0) continue;
+
+    // First text body with content is usually the title
+    if (isFirstTextBody && paragraphs.length > 0) {
+      const titleHtml = paragraphs[0];
+      parts.push(`<h1>${titleHtml}</h1>`);
+      parts.push('<div class="slide-divider"></div>');
+
+      // Remaining paragraphs in first textBody go as subtitle
+      for (let pi = 1; pi < paragraphs.length; pi++) {
+        if (paragraphs[pi].trim()) {
+          parts.push(`<h2>${paragraphs[pi]}</h2>`);
+        }
+      }
+      isFirstTextBody = false;
+    } else {
+      // Subsequent text bodies are content
+      // Check if it looks like a bullet list
+      const isList = paragraphs.length > 1 &&
+        paragraphs.filter((p) => p.trim()).length > 1;
+
+      if (isList) {
+        parts.push('<ul>');
+        for (const para of paragraphs) {
+          if (para.trim()) parts.push(`<li>${para}</li>`);
+        }
+        parts.push('</ul>');
+      } else {
+        for (const para of paragraphs) {
+          if (para.trim()) parts.push(`<p>${para}</p>`);
+        }
       }
     }
   }
 
-  return texts;
+  // ---- Extract images (blipFill references) ----
+  const blipMatches = xml.matchAll(/<a:blip\s+r:embed="(rId\d+)"/g);
+  for (const m of blipMatches) {
+    const rId = m[1];
+    const mediaFile = rIdToMedia.get(rId);
+    if (mediaFile && imageMap.has(mediaFile)) {
+      parts.push(`<img src="${imageMap.get(mediaFile)}" alt="slide image" />`);
+    }
+  }
+
+  return parts.join('\n');
 }
 
 /**
- * Decode standard XML entities
+ * Extract paragraphs from a <p:txBody> content block.
+ * Each <a:p> is a paragraph containing <a:r> text runs.
  */
+function extractParagraphs(tbContent: string): string[] {
+  const paragraphs: string[] = [];
+
+  // Split by <a:p> elements
+  const pParts = tbContent.split(/<a:p>|<a:p\s[^>]*>/);
+
+  for (let i = 1; i < pParts.length; i++) {
+    const pContent = pParts[i].split('</a:p>')[0];
+    if (!pContent) continue;
+
+    // Extract each <a:r> run within this paragraph
+    const runs = pContent.split(/<a:r>|<a:r\s[^>]*>/);
+    const runTexts: string[] = [];
+
+    for (let ri = 1; ri < runs.length; ri++) {
+      const runContent = runs[ri].split('</a:r>')[0];
+      if (!runContent) continue;
+
+      // Get run properties for formatting
+      const isBold = /<a:rPr[^>]*\bb="1"/.test(runContent);
+      const isItalic = /<a:rPr[^>]*\bi="1"/.test(runContent);
+      const isUnderline = /<a:rPr[^>]*\bu="sng"/.test(runContent);
+
+      // Extract text
+      const textMatch = runContent.match(/<a:t>([\s\S]*?)<\/a:t>/);
+      if (!textMatch) continue;
+
+      let text = decodeXmlEntities(textMatch[1]);
+      if (!text) continue;
+
+      text = escapeHtml(text);
+
+      // Apply formatting
+      if (isBold) text = `<strong>${text}</strong>`;
+      if (isItalic) text = `<em>${text}</em>`;
+      if (isUnderline) text = `<u>${text}</u>`;
+
+      runTexts.push(text);
+    }
+
+    // Also check for <a:fld> (field) text like slide numbers
+    const fieldMatches = pContent.matchAll(/<a:fld[^>]*>[\s\S]*?<a:t>([\s\S]*?)<\/a:t>[\s\S]*?<\/a:fld>/g);
+    for (const fm of fieldMatches) {
+      const fieldText = decodeXmlEntities(fm[1]).trim();
+      if (fieldText) runTexts.push(escapeHtml(fieldText));
+    }
+
+    paragraphs.push(runTexts.join(''));
+  }
+
+  return paragraphs;
+}
+
 function decodeXmlEntities(str: string): string {
   return str
     .replace(/&amp;/g, '&')
@@ -241,21 +353,10 @@ function decodeXmlEntities(str: string): string {
     .replace(/&apos;/g, "'");
 }
 
-/**
- * Truncate text to fit within a given width
- */
-function truncateText(
-  text: string,
-  pdfFont: { widthOfTextAtSize: (text: string, size: number) => number },
-  fontSize: number,
-  maxWidth: number
-): string {
-  if (!text) return text;
-  if (pdfFont.widthOfTextAtSize(text, fontSize) <= maxWidth) return text;
-
-  let truncated = text;
-  while (truncated.length > 0 && pdfFont.widthOfTextAtSize(truncated + '...', fontSize) > maxWidth) {
-    truncated = truncated.slice(0, -1);
-  }
-  return truncated + '...';
+function escapeHtml(str: string): string {
+  return str
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
 }
